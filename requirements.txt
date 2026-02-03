@@ -1,0 +1,13 @@
+streamlit
+python-dotenv
+requests
+pytesseract
+pillow
+python-docx
+pymupdf
+openai
+SpeechRecognition
+pyaudio
+streamlit-webrtc
+groq
+PyPDF2
