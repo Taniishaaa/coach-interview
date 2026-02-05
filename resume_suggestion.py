@@ -3,12 +3,42 @@ import os
 from dotenv import load_dotenv
 from groq import Groq
 from io import BytesIO
+import fitz  # PyMuPDF
+import easyocr
+import numpy as np
+from PIL import Image
+import json
+import streamlit as st
 
 try:
     import PyPDF2
 except ImportError:
     st.error("PyPDF2 library not found. Please run `pip install PyPDF2`")
     PyPDF2 = None
+
+@st.cache_resource
+def get_ocr_reader():
+    """Initializes EasyOCR reader and caches it to prevent reloading."""
+    return easyocr.Reader(['en'])
+
+# Your chunking function should also be at the top level
+def chunk_text(text, chunk_size=2000, overlap=200):
+    """Breaks text into smaller parts. Handles small files gracefully."""
+    if not text or not text.strip():
+        return []
+    
+    # If the text is smaller than the chunk size, return it as one chunk
+    if len(text) <= chunk_size:
+        return [text]
+        
+    chunks = []
+    for i in range(0, len(text), chunk_size - overlap):
+        chunk = text[i : i + chunk_size]
+        if chunk.strip(): # Only add non-empty chunks
+            chunks.append(chunk)
+    return chunks
+
+
 
 def show_resume_suggestion():
     load_dotenv()
@@ -89,63 +119,98 @@ def show_resume_suggestion():
     
     uploaded_file = st.file_uploader(
         "📄 Upload Resume",
-        type=["pdf", "docx", "doc", "txt"],
-        help="Supported formats: PDF, DOCX, DOC, TXT",
+        type=["pdf", "docx", "doc", "txt", "png", "jpg", "jpeg"],
+        help="Supported formats: PDF, DOCX, DOC, TXT, PNG, JPG, JPEG",
         accept_multiple_files=False
     )
+# ---------------- MAIN CONTENT ----------------
+    # (Inside show_resume_suggestion function)
 
     if uploaded_file is not None:
         if st.button("GENERATE AUDIT REPORT", use_container_width=True):
-                if not client:
-                     st.error("Groq API Key not found!")
-                else:
-                    with st.spinner("AI Auditor at work..."):
-                        try:
-                            resume_text = ""
-                            file_type = uploaded_file.name.split('.')[-1].lower()
+            if not client:
+                st.error("Groq API Key not found!")
+            else:
+                reader = get_ocr_reader()
+                with st.spinner("Processing (No-Install Mode)..."):
+                    try:
+                        # 1. INITIALIZE TEMPORARY LIBRARY
+                        # Ensures the in-memory storage exists before use
+                        if "temp_ocr_library" not in st.session_state:
+                            st.session_state.temp_ocr_library = {}
                             
-                            # Extract text based on file type
-                            if file_type == "pdf":
-                                if not PyPDF2:
-                                    st.error("PyPDF2 library is missing. Run: `pip install PyPDF2`")
-                                else:
-                                    pdf_reader = PyPDF2.PdfReader(uploaded_file)
-                                    for page in pdf_reader.pages:
-                                        resume_text += page.extract_text()
+                        full_extracted_text = ""
+                        file_type = uploaded_file.name.split('.')[-1].lower()
+
+                        # 2. NO-POPPLER PDF HANDLING
+                        if file_type == "pdf":
+                             # Open PDF directly from memory using PyMuPDF (fitz)
+                             doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
+                             for page in doc:
+                                # Render page to an image (pixmap) internally
+                                pix = page.get_pixmap()
+                                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                             
-                            elif file_type == "txt":
-                                # Read text file directly
-                                resume_text = uploaded_file.read().decode("utf-8")
+                                # Run EasyOCR on the image array
+                                img_array = np.array(img)
+                                results = reader.readtext(img_array, detail=0)
+                                full_extracted_text += " ".join(results) + "\n"
+                    
+                        # 3. IMAGE HANDLING
+                        # Standard image formats processed directly through EasyOCR
+                        elif file_type in ["png", "jpg", "jpeg"]:
+                            img = Image.open(uploaded_file)
+                            img_array = np.array(img)
+                            results = reader.readtext(img_array, detail=0)
+                            full_extracted_text = " ".join(results)
+
+                        # 4. JSON STORAGE
+                        # Package extraction results into a JSON-like dictionary
+                        ocr_json = {
+                            "filename": uploaded_file.name,
+                            "text": full_extracted_text.strip(),
+                            "status": "extracted"
+                        }
+                        st.session_state.temp_ocr_library[uploaded_file.name] = ocr_json
+                    
+                        # 5. CHUNKING PROCESS
+                        text_to_process = ocr_json.get("text", "")
+                    
+                        if text_to_process and len(text_to_process.strip()) > 0:
+                            # Break text into 2000-char segments with 200-char overlap
+                            text_chunks = chunk_text(text_to_process, chunk_size=2000, overlap=200)
+                        
+                            if isinstance(text_chunks, list) and len(text_chunks) > 0:
+                                context_for_model = "\n\n".join(str(c) for c in text_chunks)
+                                st.session_state.resume_text = context_for_model
                             
-                            elif file_type in ["docx", "doc"]:
-                                try:
-                                    import docx
-                                    doc = docx.Document(uploaded_file)
-                                    for para in doc.paragraphs:
-                                        resume_text += para.text + "\n"
-                                except ImportError:
-                                    st.error("python-docx library is missing. Run: `pip install python-docx`")
-                                except Exception as e:
-                                    st.error(f"Error reading DOCX file: {str(e)}")
-                            
-                            if resume_text.strip():
-                                st.session_state.resume_text = resume_text
-                                
-                                # AI Analysis
+                                # 6. MODEL INFERENCE (Groq / Llama 3.1)
                                 completion = client.chat.completions.create(
                                     messages=[
-                                        {"role": "system", "content": "You are an expert Resume Reviewer and Career Coach. Audit the following resume text. Provide a score out of 100, list top strengths, list weaknesses, and provide 3 concrete improvement suggestions. Format output in clean Markdown."},
-                                        {"role": "user", "content": resume_text}
+                                        {
+                                            "role": "system", 
+                                            "content": "You are an expert Resume Reviewer and Career Coach. Audit the following resume text. Provide a score out of 100, list top strengths, list weaknesses, and provide 3 concrete improvement suggestions. Format output in clean Markdown."
+                                        },
+                                        {"role": "user", "content": context_for_model}
                                     ],
                                     model="llama-3.1-8b-instant",
                                 )
-                            st.session_state.resume_analysis = completion.choices[0].message.content
-                            st.success("Report Generated")
-                        except Exception as e:
-                            st.error(f"Error processing resume: {str(e)}")
+                            
+                                st.session_state.resume_analysis = completion.choices[0].message.content
+                                
+                                # 7. UI REFRESH TRIGGER
+                                # Forces Streamlit to rerun and show the report immediately
+                                st.rerun()
+                                
+                            else:
+                                st.error("Chunking failed: The document could not be divided into segments.")
+                        else:
+                            st.warning("OCR completed, but no readable text was extracted. Try a clearer image.")
+
+                    except Exception as e:
+                        st.error(f"Error during processing: {str(e)}")
 
     st.markdown("</div>", unsafe_allow_html=True)
-
     # ---------------- ANALYSIS RESULTS ----------------
     if st.session_state.get("resume_analysis"):
         st.markdown('<div class="glass-card" style="margin-top: 2rem;">', unsafe_allow_html=True)
