@@ -148,13 +148,22 @@ def show_resume_suggestion():
                              doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
                              for page in doc:
                                 # Render page to an image (pixmap) internally
-                                pix = page.get_pixmap()
-                                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                            
-                                # Run EasyOCR on the image array
-                                img_array = np.array(img)
-                                results = reader.readtext(img_array, detail=0)
-                                full_extracted_text += " ".join(results) + "\n"
+                                # A. Attempt Direct Digital Extraction
+                                digital_text = page.get_text().strip()
+                                
+                                # If direct text is found (Digital PDF), use it
+                                if len(digital_text) > 50:
+                                    full_extracted_text += digital_text + "\n"
+                                else:
+                                    # B. Fallback to OCR (Scanned PDF)
+                                    # Render page to an image (pixmap) internally
+                                    pix = page.get_pixmap(dpi=150) # Moderate DPI for speed
+                                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                                
+                                    # Run EasyOCR on the image array
+                                    img_array = np.array(img)
+                                    results = reader.readtext(img_array, detail=0)
+                                    full_extracted_text += " ".join(results) + "\n"
                     
                         # 3. IMAGE HANDLING
                         # Standard image formats processed directly through EasyOCR
