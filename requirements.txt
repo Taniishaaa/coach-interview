@@ -11,3 +11,5 @@ pyaudio
 streamlit-webrtc
 groq
 PyPDF2
+easyocr
+numpy
